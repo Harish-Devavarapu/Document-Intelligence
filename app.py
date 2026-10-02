@@ -633,9 +633,27 @@ def load_classification(result_dir):
 
 
 def detect_amazon_document(result_dir):
+    """Return True only for an invoice that is actually identified as Amazon.
+
+    The previous implementation treated the mere presence of the word
+    ``amazon`` as proof that the document was an Amazon invoice. That caused
+    unrelated documents such as resumes mentioning Amazon services to be
+    routed into the structured-invoice UI.
+
+    Routing now requires both:
+      1. the document classifier to identify the document as an invoice, and
+      2. Amazon invoice evidence in the extracted source text.
+
+    All other documents use the generic OCR/presentation workflow.
+    """
+    classification, _ = load_classification(result_dir)
+    if str(classification).upper() != "INVOICE":
+        return False
+
     evidence_parts = []
     for path in find_ocr_files(result_dir):
         evidence_parts.append(read_text_file(path))
+
     for name in ("invoice_data.json", "final_invoice_data.json", "generic_final.json", "generic_fields.json"):
         path = result_dir / name
         if path.exists():
@@ -643,7 +661,23 @@ def detect_amazon_document(result_dir):
                 evidence_parts.append(path.read_text(encoding="utf-8", errors="replace"))
             except Exception:
                 pass
-    return "amazon" in "\n".join(evidence_parts).lower()
+
+    evidence = "\n".join(evidence_parts).lower()
+    if "amazon" not in evidence:
+        return False
+
+    # Require invoice-related evidence as well, so a document that merely
+    # mentions Amazon is not treated as an Amazon invoice.
+    invoice_markers = (
+        "invoice",
+        "tax invoice",
+        "invoice no",
+        "invoice number",
+        "sold by",
+        "order number",
+        "order id",
+    )
+    return any(marker in evidence for marker in invoice_markers)
 
 
 def render_mapping_cards(data, columns=3):
@@ -841,19 +875,64 @@ def _render_invoice_table(records, title, kind="product"):
 
 
 def render_structured_document(document):
-    """Render only user-facing invoice information; keep pipeline internals out of the main view."""
+    """Render user-facing invoice information while preserving observed document structure."""
     if not isinstance(document, dict):
         return
 
-    # High-value invoice identity and amount. Internal reconciliation metadata is intentionally omitted.
-    identity = [
-        ("Invoice number", ("invoice_number", "invoice_no", "invoice_id")),
-        ("Invoice date", ("invoice_date", "date")),
-        ("Order number", ("order_number", "order_no", "order_id")),
-        ("Order date", ("order_date",)),
-        ("Total amount", ("total_amount", "grand_total", "invoice_total")),
+    # Some invoice outputs store invoice/order metadata in dedicated nested
+    # objects, while other outputs keep the values at the document root.
+    # Read both forms so the UI displays values that were actually extracted.
+    invoice = document.get("invoice") if isinstance(document.get("invoice"), dict) else {}
+    order = document.get("order") if isinstance(document.get("order"), dict) else {}
+
+    overview_fields = [
+        ("Invoice number", (
+            ("invoice_number", "invoice_no", "invoice_id"),
+            invoice,
+        )),
+        ("Invoice date", (
+            ("invoice_date", "date"),
+            invoice,
+        )),
+        ("Order number", (
+            ("order_number", "order_no", "order_id"),
+            order,
+        )),
+        ("Order date", (
+            ("order_date", "date"),
+            order,
+        )),
+        ("Invoice details", (
+            ("invoice_details", "details"),
+            invoice,
+        )),
     ]
-    _render_field_group("Invoice overview", document, identity, columns=3)
+
+    overview_cards = []
+    for label, (keys, nested_data) in overview_fields:
+        value = _first_value(nested_data, *keys)
+        if not nonempty(value):
+            value = _first_value(document, *keys)
+        if nonempty(value):
+            overview_cards.append((label, value))
+
+    total_value = _first_value(document, "total_amount", "grand_total", "invoice_total")
+    totals = document.get("totals") if isinstance(document.get("totals"), dict) else {}
+    if not nonempty(total_value):
+        total_value = _first_value(totals, "total_amount", "grand_total", "invoice_total")
+    if nonempty(total_value):
+        overview_cards.append(("Total amount", total_value))
+
+    if overview_cards:
+        st.markdown('<div class="di-section-title">Invoice overview</div>', unsafe_allow_html=True)
+        cols = st.columns(min(3, len(overview_cards)))
+        for index, (label, value) in enumerate(overview_cards):
+            with cols[index % len(cols)]:
+                st.markdown(
+                    f'<div class="di-info-card"><div class="di-info-label">{label}</div>'
+                    f'<div class="di-info-value">{scalar_text(value)}</div></div>',
+                    unsafe_allow_html=True,
+                )
 
     seller = document.get("seller")
     billing = document.get("billing")
@@ -888,7 +967,9 @@ def render_structured_document(document):
         ("Address", ("address",)),
         ("State code", ("state_code",)),
     ]
-    if isinstance(shipping, dict) and any(nonempty(_first_value(shipping, *keys)) for _, keys in shipping_fields):
+    if isinstance(shipping, dict) and any(
+        nonempty(_first_value(shipping, *keys)) for _, keys in shipping_fields
+    ):
         _render_field_group("Shipping", shipping, shipping_fields, columns=3)
 
     if isinstance(supply, dict):
@@ -902,11 +983,10 @@ def render_structured_document(document):
             columns=2,
         )
 
-    totals = document.get("totals") if isinstance(document.get("totals"), dict) else {}
-    total_value = _first_value(document, "total_amount", "grand_total", "invoice_total")
-    if not nonempty(total_value):
-        total_value = _first_value(totals, "total_amount", "grand_total", "invoice_total")
-    amount_words = _first_value(document, "amount_in_words", "total_in_words") or _first_value(totals, "amount_in_words", "total_in_words")
+    amount_words = (
+        _first_value(document, "amount_in_words", "total_in_words")
+        or _first_value(totals, "amount_in_words", "total_in_words")
+    )
     if nonempty(total_value) or nonempty(amount_words):
         cards = []
         if nonempty(total_value):
@@ -918,7 +998,8 @@ def render_structured_document(document):
         for index, (label, value) in enumerate(cards):
             with cols[index % len(cols)]:
                 st.markdown(
-                    f'<div class="di-info-card"><div class="di-info-label">{label}</div><div class="di-info-value">{scalar_text(value)}</div></div>',
+                    f'<div class="di-info-card"><div class="di-info-label">{label}</div>'
+                    f'<div class="di-info-value">{scalar_text(value)}</div></div>',
                     unsafe_allow_html=True,
                 )
 
@@ -957,7 +1038,7 @@ def render_amazon_results(result_dir, result_name):
 
     st.markdown(
         f"""<div class="di-result-header">
-        <div class="di-result-kicker">✦ SUPPORTED INVOICE · STRUCTURED EXTRACTION</div>
+        <div class="di-result-kicker">✦ AMAZON INVOICE · STRUCTURED EXTRACTION</div>
         <div class="di-result-title">Invoice ready for review</div>
         <div class="di-result-file">{result_name}</div>
         </div>""",
@@ -1289,11 +1370,11 @@ def render_upload_page():
     st.markdown(
         """<div class="di-hero-v2">
             <div class="eyebrow">✦ Document processing workspace</div>
-            <h1>Invoice intelligence, built for every format.</h1>
-            <p>Extract structured information from invoices across companies and layouts. If something else is uploaded, the system falls back to OCR and shows what it can read.</p>
+            <h1>Document intelligence, built to read what you upload.</h1>
+            <p>Amazon invoices can be processed through the structured invoice workflow. Other documents are read with OCR and presented based on the information found in the source.</p>
             <div class="di-hero-points">
-                <span class="di-hero-point">✓ Invoice → structured data</span>
-                <span class="di-hero-point">✓ Different invoice formats</span>
+                <span class="di-hero-point">✓ Amazon invoice → structured data</span>
+                <span class="di-hero-point">✓ Other invoices → extracted information</span>
                 <span class="di-hero-point">✓ Other documents → OCR</span>
                 <span class="di-hero-point">✓ Source preserved</span>
             </div>

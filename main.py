@@ -32,11 +32,11 @@ SUPPORTED_EXTENSIONS = {
 
 
 # ============================================================
-# UNIVERSAL INVOICE PIPELINE
+# AMAZON INVOICE PIPELINE
 #
-# The current extraction modules are universal.
-# Do not route only by company name.
-# Any document classified as INVOICE uses this pipeline.
+# Only Amazon invoices use the detailed structured invoice
+# extraction pipeline. Other documents, including invoices from
+# other companies, remain on the generic OCR route.
 # ============================================================
 
 INVOICE_PIPELINE = [
@@ -296,17 +296,67 @@ def classify_document(work_dir):
 
 
 # ============================================================
+# AMAZON INVOICE DETECTION
+# ============================================================
+
+def is_amazon_invoice(work_dir, document_type):
+    """
+    Route only genuine Amazon invoices to the structured invoice
+    pipeline.
+
+    A document must already be classified as INVOICE and contain
+    Amazon-specific evidence in its canonical OCR text.  Other
+    invoices (for example Flipkart) remain on the generic OCR route.
+    """
+    if str(document_type).strip().upper() != "INVOICE":
+        return False
+
+    ocr_files = sorted(
+        work_dir.glob("page_*_ocr.txt"),
+        key=lambda path: (
+            int(path.stem.split("_")[1])
+            if len(path.stem.split("_")) > 1
+            and path.stem.split("_")[1].isdigit()
+            else 999999
+        ),
+    )
+
+    if not ocr_files:
+        return False
+
+    try:
+        combined_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in ocr_files
+        ).lower()
+    except Exception:
+        return False
+
+    # Amazon-specific evidence.  The document must be an invoice
+    # already, so ordinary resumes containing Amazon technologies
+    # cannot enter this route.
+    amazon_markers = (
+        "amazon.in",
+        "amazon india",
+        "amazon seller services",
+        "amazon pay",
+        "amazon marketplace",
+        "amazon fulfillment",
+        "amazon transport services",
+    )
+
+    return any(marker in combined_text for marker in amazon_markers)
+
+
+# ============================================================
 # INVOICE PIPELINE
 # ============================================================
 
 def process_invoice(work_dir):
     """
-    Run the current universal invoice pipeline.
-
-    IMPORTANT:
-    This is intentionally called INVOICE PIPELINE rather than
-    AMAZON PIPELINE. The extraction modules are designed to
-    work from observed document structure, not company names.
+    Run the detailed structured invoice pipeline for an Amazon
+    invoice. The extraction itself remains observation-based and
+    is not hard-coded to individual field values.
     """
 
     print()
@@ -498,9 +548,12 @@ def process_document(input_file):
     print()
     print(f"Detected Type : {document_type}")
 
-    if document_type == "INVOICE":
+    if document_type == "INVOICE" and is_amazon_invoice(
+        work_dir,
+        document_type,
+    ):
         print(
-            "Route         : Universal Invoice Pipeline"
+            "Route         : Amazon Invoice Pipeline"
         )
 
         success = process_invoice(
